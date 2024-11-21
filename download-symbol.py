@@ -1,7 +1,7 @@
 import os
 import yfinance as yf # type: ignore
 
-ticker = os.getenv("TICKER") + ".NS"
+ticker = os.getenv("TICKER") + ".L"
 
 start_date = "2000-01-01"
 end_date = "2024-10-31"
