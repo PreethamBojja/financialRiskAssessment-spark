@@ -1,4 +1,4 @@
-^GSPC
-^IXIC
-^TYX
-^FVX
+GSPC
+IXIC
+TYX
+FVX

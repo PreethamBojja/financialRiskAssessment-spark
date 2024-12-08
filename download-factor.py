@@ -6,7 +6,7 @@ ticker = os.getenv("TICKER")
 start_date = "2000-01-01"
 end_date = "2024-10-31"
 
-data = yf.download(ticker, start=start_date, end=end_date)
+data = yf.download("^" + ticker, start=start_date, end=end_date)
 
 if not data.empty:
     csv_file = f"factors/{ticker}.csv"
