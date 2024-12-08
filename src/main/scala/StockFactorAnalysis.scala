@@ -1,13 +1,20 @@
 import org.apache.hadoop.fs.{FileSystem, Path}
+import org.apache.spark.sql.{SparkSession, DataFrame}
 import org.apache.spark.sql.functions._
-import org.apache.spark.sql.{DataFrame, Row, SparkSession}
 import java.time.LocalDate
-import org.joda.time.{DateTime, Days}
+import java.sql.Date
 import scala.collection.mutable.ArrayBuffer
 import org.apache.commons.math3.stat.regression.OLSMultipleLinearRegression
-import org.apache.spark.sql.SaveMode
 
 object StockFactorAnalysis {
+
+  // Create a SparkSession object
+  val spark: SparkSession = SparkSession.builder()
+    .appName("StockFactorAnalysis")
+    .master("local[*]")  // Adjust this if you're using a cluster
+    .getOrCreate()
+
+  import spark.implicits._  // Now spark.implicits._ will work
 
   // Define the trimToRegion function
   def trimToRegion(history: Array[(LocalDate, Double)], start: LocalDate, end: LocalDate): Array[(LocalDate, Double)] = {
@@ -62,7 +69,13 @@ object StockFactorAnalysis {
 
   // Convert DataFrame to Array[(LocalDate, Double)]
   def dfToArray(df: DataFrame): Array[(LocalDate, Double)] = {
-    df.select("Date", "Close").as[(LocalDate, Double)].collect().toArray
+    df.select("Date", "Close")
+      .as[(String, Double)] // Temporarily select String (date) and Double (close)
+      .map { case (dateStr, close) =>
+        (LocalDate.parse(dateStr), close) // Convert to LocalDate
+      }
+      .collect()
+      .toArray
   }
 
   // Function to create the factor matrix
@@ -90,16 +103,13 @@ object StockFactorAnalysis {
 
   // Main function to execute the application
   def main(args: Array[String]): Unit = {
-    val spark = SparkSession.builder
-      .appName("StockFactorAnalysis")
-      .getOrCreate()
-
     val start = LocalDate.parse("2023-12-01")
     val end = LocalDate.parse("2024-11-30")
     val directoryPath = "/user/sb9509_nyu_edu/stocks"
     val fs = FileSystem.get(spark.sparkContext.hadoopConfiguration)
     val stockFiles = fs.listStatus(new Path(directoryPath)).filter(_.getPath.getName.endsWith(".csv")).map(_.getPath.toString)
 
+    // Reading stock data files and processing
     val stockData = stockFiles.map { filePath =>
       val stockName = filePath.split("/").last.stripSuffix(".L.csv")
       val rawDf = spark.read.option("header", false).option("inferSchema", "true").csv(filePath)
@@ -108,13 +118,14 @@ object StockFactorAnalysis {
       val columnNames = Seq("Date", "AdjClose", "Close", "Open", "High", "Low", "Volume")
       val finalDf = filteredDf.toDF(columnNames: _*)
       val selectedDf = finalDf.select($"Date", $"Close").withColumn("Date", to_date($"Date", "yyyy-MM-dd")).withColumn("Close", $"Close".cast("double"))
-      val stockArray = selectedDf.as[(LocalDate, Double)].collect()
-      val trimmedStockData = trimToRegion(stockArray, start, end)
+      val stockArray = selectedDf.as[(String, Double)].collect()
+      val trimmedStockData = trimToRegion(stockArray.map { case (dateStr, close) => (LocalDate.parse(dateStr), close) }, start, end)
       val filledStockData = fillInHistory(trimmedStockData, start, end)
       val filledStockDf = spark.createDataFrame(filledStockData).toDF("Date", "Close")
       (stockName, filledStockDf)
     }
 
+    // Reading factor data files and processing
     val factorDirectoryPath = "/user/sb9509_nyu_edu/factors/factors"
     val factorFiles = fs.listStatus(new Path(factorDirectoryPath)).filter(_.getPath.getName.endsWith(".csv")).map(_.getPath.toString)
 
@@ -126,13 +137,14 @@ object StockFactorAnalysis {
       val factorColumnNames = Seq("Date", "AdjClose", "Close", "Open", "High", "Low", "Volume")
       val finalFactorDf = filteredFactorDf.toDF(factorColumnNames: _*)
       val selectedFactorDf = finalFactorDf.select($"Date", $"Close").withColumn("Date", to_date($"Date", "yyyy-MM-dd")).withColumn("Close", $"Close".cast("double"))
-      val factorArray = selectedFactorDf.as[(LocalDate, Double)].collect()
-      val trimmedData = trimToRegion(factorArray, start, end)
+      val factorArray = selectedFactorDf.as[(String, Double)].collect()
+      val trimmedData = trimToRegion(factorArray.map { case (dateStr, close) => (LocalDate.parse(dateStr), close) }, start, end)
       val filledData = fillInHistory(trimmedData, start, end)
       val filledDf = spark.createDataFrame(filledData).toDF("Date", "Close")
       (factorName, filledDf)
     }
 
+    // Calculating factor returns
     val factorReturns = factorData.map { case (factorName, filledData) =>
       val filledArray = dfToArray(filledData)
       val factorReturns = twoWeekReturns(filledArray)
@@ -143,9 +155,13 @@ object StockFactorAnalysis {
       (factorName, factorReturnsDf)
     }
 
-    val factorFeatures = factorMatrix(factorReturns.map { case (_, df) => df.as[(LocalDate, Double)].collect().map(_._2) })
+    // Creating the factor feature matrix
+    val factorFeatures = factorMatrix(factorReturns.map { case (_, df) =>
+      df.as[(LocalDate, Double)].collect().map(_._2)
+    })
       .map(featurize)
 
+    // Calculating stock returns
     val stockReturns = stockData.map { case (stockName, filledData) =>
       val filledArray = dfToArray(filledData)
       val stockReturns = twoWeekReturns(filledArray)
@@ -156,17 +172,18 @@ object StockFactorAnalysis {
       (stockName, stockReturnsDf)
     }
 
+    // Extracting the stock return values for regression
     val stockReturnValues = stockReturns.map { case (_, df) =>
       df.as[(LocalDate, Double)].collect().map(_._2)
     }
 
+    // Performing linear regression for each stock
     val factorWeights = stockReturnValues.map { stockReturns =>
       linearModel(stockReturns, factorFeatures).estimateRegressionParameters()
     }.toArray
 
     // Save or display the factor weights
     println(s"Factor Weights: ${factorWeights.mkString(", ")}")
-    spark.stop()
+    spark.stop() // Stop the Spark session after use
   }
 }
-
