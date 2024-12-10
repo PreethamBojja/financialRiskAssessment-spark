@@ -5,6 +5,11 @@ import java.time.LocalDate
 import java.sql.Date
 import scala.collection.mutable.ArrayBuffer
 import org.apache.commons.math3.stat.regression.OLSMultipleLinearRegression
+import org.apache.commons.math3.stat.correlation.PearsonsCorrelation
+import org.apache.commons.math3.stat.correlation.Covariance
+import org.apache.commons.math3.distribution.MultivariateNormalDistribution
+import org.apache.commons.math3.random.MersenneTwister
+import org.apache.spark.sql.Dataset
 
 object StockFactorAnalysis {
   // Create SparkSession at the object level
@@ -101,11 +106,46 @@ object StockFactorAnalysis {
     regression
   }
 
+  def instrumentTrialReturn(instrument: Array[Double], trial: Array[Double]): Double = {
+      var instrumentTrialReturn = instrument(0)
+      var i = 0
+      while (i < trial.length) {
+          instrumentTrialReturn += trial(i) * instrument(i+1)
+          i += 1
+      }
+      instrumentTrialReturn
+  }
+
+  def trialReturn(trial: Array[Double], instruments: Seq[Array[Double]]): Double = {
+      var totalReturn = 0.0
+      for (instrument <- instruments) {
+          totalReturn += instrumentTrialReturn(instrument, trial)
+      }
+      totalReturn / instruments.size
+  }
+
+  def trialReturns(seed: Long, numTrials: Int, factorWeights: Seq[Array[Double]], factorMeans: Array[Double], factorCovariances: Array[Array[Double]]): Seq[Double] = {
+      val rand = new MersenneTwister(seed)
+      val multivariateNormal = new MultivariateNormalDistribution(rand, factorMeans, factorCovariances)
+      val trialReturns = new Array[Double](numTrials)
+      for (i <- 0 until numTrials) {
+          val trialFactorReturns = multivariateNormal.sample()
+          val trialFeatures = featurize(trialFactorReturns)
+          trialReturns(i) = trialReturn(trialFeatures, factorWeights)
+      }
+      trialReturns
+  }
+
+  def fivePercentVaR(trials: Dataset[Double]): Double = {
+      val quantiles = trials.stat.approxQuantile("value",Array(0.05), 0.0)
+      quantiles.head
+  }
+
   // Main function to execute the application
   def main(args: Array[String]): Unit = {
     try {
       // Allow configuration via command-line arguments
-      val start = if (args.length > 0) LocalDate.parse(args(0)) else LocalDate.parse("2023-12-01")
+      val start = if (args.length > 0) LocalDate.parse(args(0)) else LocalDate.parse("2009-12-01")
       val end = if (args.length > 1) LocalDate.parse(args(1)) else LocalDate.parse("2024-11-30")
       
       val directoryPath = if (args.length > 2) args(2) else "/user/sb9509_nyu_edu/stocks"
@@ -115,7 +155,7 @@ object StockFactorAnalysis {
       val fs = FileSystem.get(spark.sparkContext.hadoopConfiguration)
       val stockFiles = fs.listStatus(new Path(directoryPath))
         .filter(_.getPath.getName.endsWith(".csv"))
-        .map(_.getPath.toString)
+        .map(_.getPath.toString).take(500)
 
       // Reading stock data files and processing
       val stockData = stockFiles.map { filePath =>
@@ -189,8 +229,7 @@ object StockFactorAnalysis {
         (factorName, filledDf)
       }
 
-      // Calculating factor returns
-      val factorReturns = factorData.map { case (factorName, filledData) =>
+      val factorsWithReturns = factorData.map { case (factorName, filledData) =>
         val filledArray = dfToArray(filledData)
         val factorReturns = twoWeekReturns(filledArray)
         val factorReturnsData = filledArray.zip(factorReturns).map {
@@ -200,14 +239,12 @@ object StockFactorAnalysis {
         (factorName, factorReturnsDf)
       }
 
-      // Creating the factor feature matrix
-      val factorFeatures = factorMatrix(factorReturns.map { case (_, df) =>
-        df.as[(LocalDate, Double)].collect().map(_._2)
-      })
-        .map(featurize)
+      val factorReturns: Seq[Array[Double]] = factorsWithReturns.map {
+        case (_, df) => 
+          df.as[(LocalDate, Double)].collect().map(_._2) // Extract only the Double values
+      }.toSeq
 
-      // Calculating stock returns
-      val stockReturns = stockData.map { case (stockName, filledData) =>
+      val stockWithReturns = stockData.map { case (stockName, filledData) =>
         val filledArray = dfToArray(filledData)
         val stockReturns = twoWeekReturns(filledArray)
         val stockReturnsData = filledArray.zip(stockReturns).map {
@@ -217,21 +254,36 @@ object StockFactorAnalysis {
         (stockName, stockReturnsDf)
       }
 
-      // Extracting the stock return values for regression
-      val stockReturnValues = stockReturns.map { case (_, df) =>
-        df.as[(LocalDate, Double)].collect().map(_._2)
-      }
+      val stockReturns: Seq[Array[Double]] = stockWithReturns.map {
+        case (_, df) => 
+          df.as[(LocalDate, Double)].collect().map(_._2) // Extract only the Double values
+      }.toSeq
 
-      // Performing linear regression for each stock
-      val factorWeights = stockReturnValues.map { stockReturns =>
-        linearModel(stockReturns, factorFeatures).estimateRegressionParameters()
-      }.toArray
+      println("Checkpoint 1 ")
+      val factorFeatures = factorMatrix(factorReturns).map(featurize)
 
-      // Save or display the factor weights
-      println("Factor Weights:")
-      factorWeights.zipWithIndex.foreach { case (weights, index) =>
-        println(s"Stock ${index + 1}: ${weights.mkString(", ")}")
-      }
+      val factorWeights = stockReturns.map(linearModel(_, factorFeatures)).map(_.estimateRegressionParameters()).toArray
+      println("Checkpoint 2 ")
+      val factorCor = new PearsonsCorrelation(factorMatrix(factorReturns)).getCorrelationMatrix().getData()
+
+      val factorCov = new Covariance(factorMatrix(factorReturns)).getCovarianceMatrix().getData()
+      println("Checkpoint 3 ")
+      val factorMeans = factorReturns.map(factor => factor.sum / factor.size).toArray
+
+      val parallelism = 1000
+      val baseSeed = 1496
+      println("Checkpoint 4 ")
+      val seeds = (baseSeed until baseSeed + parallelism)
+      val seedDS = seeds.toDS().repartition(parallelism)
+      println("Checkpoint 5 ")
+      val numTrials = 1000000
+      val trials = seedDS.flatMap(trialReturns(_, numTrials / parallelism, factorWeights.toSeq, factorMeans, factorCov))
+      println("Checkpoint 6 ")
+      trials.cache()
+      println("Checkpoint 7 ")
+      val valueAtRisk = fivePercentVaR(trials)
+      println(valueAtRisk)
+      println("Checkpoint 8 ")
 
     } catch {
       case e: Exception => 
